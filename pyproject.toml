@@ -95,6 +95,11 @@ build = [
     "cp314t-manylinux_aarch64",
     "cp314t-musllinux_x86_64",
     "cp314t-musllinux_aarch64",
+    # iOS builds start at CPython 3.13. These wheels still use abi3, but keep
+    # their cp313 tag because older CPython iOS tags are not supported.
+    "cp313-ios_arm64_iphoneos",
+    "cp313-ios_arm64_iphonesimulator",
+    "cp313-ios_x86_64_iphonesimulator",
 ]
 before-all = "make preprocess"
 test-requires = "pytest"
@@ -107,6 +112,10 @@ test-skip = [
     "cp314t-win_arm64",
     "cp310-manylinux_armv7l",
     "cp310-manylinux_riscv64",
+    # cibuildwheel can only run iOS tests on a simulator matching the build
+    # machine, not on physical iphoneos devices or every simulator arch in this
+    # build set.
+    "cp313-ios_*",
 ]
 build-verbosity = 1
 
@@ -123,6 +132,9 @@ environment-pass = ["LD_LIBRARY_PATH"]
 [tool.cibuildwheel.android]
 archs = ["arm64_v8a", "x86_64"]
 
+[tool.cibuildwheel.ios]
+archs = ["arm64_iphoneos", "arm64_iphonesimulator", "x86_64_iphonesimulator"]
+before-all = "gmake preprocess"
 
 [tool.cibuildwheel.macos]
 before-all = "gmake preprocess"

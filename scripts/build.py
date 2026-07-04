@@ -27,12 +27,17 @@ def is_android_env() -> bool:
     )
 
 
+def get_multiarch() -> str:
+    return getattr(sys.implementation, "_multiarch", "")
+
+
 def detect_arch():
     with open(Path(__file__).parent.parent / "libs.json") as f:
         archs = json.loads(f.read())
 
     uname = platform.uname()
     uname_system = "Android" if is_android_env() else uname.system
+    multiarch = get_multiarch()
     glibc_flavor = "gnueabihf" if uname.machine in ["armv7l", "armv6l"] else "gnu"
 
     libc, _ = platform.libc_ver()
@@ -48,6 +53,7 @@ def detect_arch():
             and arch["machine"] == uname.machine
             and arch["pointer_size"] == pointer_size
             and ("libc" not in arch or arch.get("libc") == libc)
+            and ("multiarch" not in arch or arch.get("multiarch") == multiarch)
         ):
             if arch.get("libdir"):
                 arch["libdir"] = os.path.expanduser(arch["libdir"])
@@ -161,7 +167,7 @@ download_libcurl()
 static_libs = get_curl_archives()
 extra_link_args = []
 if is_static:
-    if system == "Darwin":
+    if system in ("Darwin", "iOS"):
         extra_link_args = [
             f"-Wl,-force_load,{static_libs[0]}",
             "-lc++",
@@ -195,7 +201,7 @@ ffibuilder.set_source(
         str(root_dir / "ffi/shim.c"),
     ],
     extra_compile_args=(
-        ["-Wno-implicit-function-declaration"] if system == "Darwin" else []
+        ["-Wno-implicit-function-declaration"] if system in ("Darwin", "iOS") else []
     ),
     extra_link_args=extra_link_args,
 )

@@ -7,8 +7,9 @@ class bdist_wheel_abi3(bdist_wheel):
         python, abi, plat = super().get_tag()
 
         if python.startswith("cp") and not (python.endswith("t") or abi.endswith("t")):
-            if "android" in plat:
-                # cibuildwheel supports android since cp313, so we can't mark it as 310
+            if "android" in plat or "ios" in plat:
+                # cibuildwheel supports mobile platforms since cp313, so we
+                # can't mark those wheels as cp310 even though they use abi3.
                 return python, "abi3", plat
             # On CPython, our wheels are abi3 and compatible back to 3.10.
             # Free-threaded builds ("t" tag) must keep their original tags (PEP 803).

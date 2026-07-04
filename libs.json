@@ -48,6 +48,36 @@
         "arch": "arm64"
     },
     {
+        "system": "iOS",
+        "machine": "arm64",
+        "pointer_size": 64,
+        "sysname": "apple-ios",
+        "link_type": "static",
+        "obj_name": "libcurl-impersonate.a",
+        "arch": "arm64",
+        "multiarch": "arm64-iphoneos"
+    },
+    {
+        "system": "iOS",
+        "machine": "arm64",
+        "pointer_size": 64,
+        "sysname": "apple-ios-simulator",
+        "link_type": "static",
+        "obj_name": "libcurl-impersonate.a",
+        "arch": "arm64",
+        "multiarch": "arm64-iphonesimulator"
+    },
+    {
+        "system": "iOS",
+        "machine": "x86_64",
+        "pointer_size": 64,
+        "sysname": "apple-ios-simulator",
+        "link_type": "static",
+        "obj_name": "libcurl-impersonate.a",
+        "arch": "x86_64",
+        "multiarch": "x86_64-iphonesimulator"
+    },
+    {
         "system": "Linux",
         "machine": "x86_64",
         "pointer_size": 64,
