@@ -1,5 +1,6 @@
 import base64
 import json
+import pickle
 import time
 from io import BytesIO
 from uuid import uuid4
@@ -15,8 +16,10 @@ from curl_cffi.requests.exceptions import (
     CertificateVerifyError,
     HTTPError,
     TooManyRedirects,
+    UnrewindableBodyError,
 )
 from curl_cffi.requests.models import Response
+from curl_cffi.requests.streams import _IterableReader
 from curl_cffi.utils import CurlCffiWarning
 
 
@@ -55,6 +58,27 @@ def test_response_request_body(server):
     assert r.request.body is None
 
 
+def test_response_pickle(server):
+    url = str(server.url.copy_with(path="/set_cookies"))
+    response = requests.get(url)
+    expected_text = response.text
+
+    restored = pickle.loads(pickle.dumps(response))
+
+    assert restored.url == response.url
+    assert restored.content == response.content
+    assert restored.text == expected_text
+    assert restored.status_code == response.status_code
+    assert restored.headers == response.headers
+    assert restored.cookies["foo"] == "bar"
+    assert restored.request.url == response.request.url
+    assert restored.curl is None
+    assert restored.queue is None
+    assert restored.stream_task is None
+    assert restored.astream_task is None
+    assert restored.quit_now is None
+
+
 def test_callback(server):
     buffer = BytesIO()
     r = requests.post(
@@ -64,6 +88,14 @@ def test_callback(server):
     )
     assert r.status_code == 200
     assert buffer.getvalue() == b"foo=bar"
+
+
+def test_callback_keyboard_interrupt(server):
+    def callback(data: bytes):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        requests.get(str(server.url), content_callback=callback)
 
 
 def test_post_large_body(server):
@@ -111,6 +143,119 @@ def test_post_form(server):
     r = requests.post(str(server.url.copy_with(path="/echo_body")), data=data)
     assert r.status_code == 200
     assert r.content == b"foo%5B%5D=7&foo%5B%5D=8&bar=9"
+
+
+def test_post_iterable_body(server):
+    def gen():
+        yield b"foo"
+        yield b"x" * 200000
+        yield b"bar"
+
+    r = requests.post(str(server.url.copy_with(path="/echo_body")), content=gen())
+    assert r.status_code == 200
+    assert r.content == b"foo" + b"x" * 200000 + b"bar"
+
+
+def test_post_file_like_body(server, tmp_path):
+    path = tmp_path / "body.bin"
+    path.write_bytes(b"streamed-from-file")
+
+    with path.open("rb") as f:
+        r = requests.post(str(server.url.copy_with(path="/echo_body")), content=f)
+    assert r.status_code == 200
+    assert r.content == b"streamed-from-file"
+
+
+def test_file_like_content_overrides_content_length(server, tmp_path):
+    path = tmp_path / "body.bin"
+    path.write_bytes(b"streamed-from-file")
+
+    with path.open("rb") as f:
+        r = requests.post(
+            str(server.url.copy_with(path="/echo_body")),
+            content=f,
+            headers={"Content-Length": "1"},
+        )
+
+    assert r.request.headers["Content-Length"] == str(len(b"streamed-from-file"))
+    assert r.content == b"streamed-from-file"
+
+
+def test_post_content_chunk_list(server):
+    r = requests.post(
+        str(server.url.copy_with(path="/echo_body")),
+        content=[b"foo", b"bar"],
+    )
+    assert r.content == b"foobar"
+
+
+def test_sync_session_rejects_async_content(server):
+    async def content():
+        yield b"raw"
+
+    with pytest.raises(TypeError):
+        requests.post(str(server.url), content=content())
+
+
+def test_iterable_reader_returns_available_chunk_immediately():
+    consumed = []
+
+    def chunks():
+        consumed.append("first")
+        yield b"foo"
+        consumed.append("second")
+        yield b"bar"
+
+    reader = _IterableReader(chunks())
+    assert reader.read(65536) == b"foo"
+    assert consumed == ["first"]
+    assert reader.read(65536) == b"bar"
+
+
+def test_seekable_content_rewinds_for_redirect(server, tmp_path):
+    path = tmp_path / "redirect-body.bin"
+    path.write_bytes(b"skip-streamed-body")
+
+    with path.open("rb") as f:
+        f.seek(5)
+        r = requests.post(
+            str(server.url.copy_with(path="/redirect_307")),
+            content=f,
+            allow_redirects=True,
+        )
+    assert r.content == b"streamed-body"
+
+
+def test_one_shot_content_redirect_is_unrewindable(server):
+    with pytest.raises(UnrewindableBodyError):
+        requests.post(
+            str(server.url.copy_with(path="/redirect_307")),
+            content=iter([b"streamed-body"]),
+            allow_redirects=True,
+        )
+
+
+def test_seekable_content_rewinds_for_retry(server, tmp_path):
+    path = tmp_path / "retry-body.bin"
+    path.write_bytes(b"retry-file-body")
+    url = server.url.copy_with(path="/retry_body", query=f"key={uuid4().hex}".encode())
+
+    with (
+        path.open("rb") as f,
+        requests.Session(retry=1, raise_for_status=True) as session,
+    ):
+        r = session.post(str(url), content=f)
+    assert r.content == b"retry-file-body"
+
+
+def test_one_shot_content_is_not_retried(server):
+    url = server.url.copy_with(path="/retry_body", query=f"key={uuid4().hex}".encode())
+
+    with (
+        requests.Session(retry=1, raise_for_status=True) as session,
+        pytest.raises(UnrewindableBodyError),
+    ):
+        session.post(str(url), content=iter([b"important-body"]))
 
 
 def test_post_redirect_to_get(server):
@@ -490,15 +635,32 @@ def test_not_follow_redirects(server):
     )
     assert r.status_code == 301
     assert r.redirect_count == 0
+    assert r.history == []
     assert r.content == b"Redirecting..."
 
 
 def test_follow_redirects(server):
-    r = requests.get(
-        str(server.url.copy_with(path="/redirect_301")), allow_redirects=True
-    )
+    url = str(server.url.copy_with(path="/redirect_301"))
+    r = requests.get(url, allow_redirects=True)
     assert r.status_code == 200
     assert r.redirect_count == 1
+    assert len(r.history) == 1
+    assert isinstance(r.history[0], Response)
+    assert r.history[0].url == url
+    assert r.history[0].status_code == 301
+    assert r.history[0].headers["location"] == "/"
+    assert r.history[0].is_redirect
+    assert r.history[0].content == b""
+
+
+def test_multiple_redirect_history(server):
+    url = str(server.url.copy_with(path="/redirect_to")) + "?to=/redirect_301"
+    intermediate_url = str(server.url.copy_with(path="/redirect_301"))
+    r = requests.get(url)
+
+    assert [response.status_code for response in r.history] == [301, 301]
+    assert [response.url for response in r.history] == [url, intermediate_url]
+    assert all(response.history == [] for response in r.history)
 
 
 def test_too_many_redirects(server):
@@ -508,6 +670,7 @@ def test_too_many_redirects(server):
     assert e.value.code == CurlECode.TOO_MANY_REDIRECTS
     assert isinstance(e.value.response, Response)
     assert e.value.response.status_code == 301
+    assert len(e.value.response.history) == 2
 
 
 def test_safe_redirect_blocks_private_ip(server, https_server):
@@ -902,6 +1065,16 @@ def test_stream_iter_content(server):
         with s.stream("GET", url, params={"n": "20"}) as r:
             for chunk in r.iter_content():
                 assert b"path" in chunk
+
+
+def test_stream_response_pickle_raises(server):
+    url = str(server.url.copy_with(path="/stream"))
+    with (
+        requests.Session() as session,
+        session.stream("GET", url, params={"n": "1"}) as response,
+        pytest.raises(TypeError, match="Streaming responses cannot be pickled"),
+    ):
+        pickle.dumps(response)
 
 
 def test_stream_iter_content_break(server):

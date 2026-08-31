@@ -101,10 +101,14 @@ def _extract_target_payload(payload: object, target: str) -> dict[str, object] |
     return None
 
 
-def _load_raw_fingerprint(target: str, api_root: str) -> dict[str, object]:
+def _load_raw_fingerprint(
+    target: str,
+    api_root: str,
+    protocol: str,
+) -> dict[str, object]:
     api_key = _require_live_api_key()
     base_url = f"{api_root.rstrip('/')}{RAW_PATH}"
-    url = f"{base_url}?{urlencode({'name': target})}"
+    url = f"{base_url}?{urlencode({'name': target, 'protocol': protocol})}"
     try:
         payload = _request_json(url, api_key=api_key)
     except Exception as exc:
@@ -538,6 +542,37 @@ def test_normalize_ja3_sorts_extension_segment():
     assert _normalize_ja3(raw_ja3) == "771,4865-4866,10-23-35,29-23,0"
 
 
+def test_load_raw_fingerprint_requests_protocol(monkeypatch):
+    requests = []
+
+    def fetch_payload(url, headers):
+        requests.append((url, headers))
+        return json.dumps(
+            {
+                "name": "testing",
+                "source": "ping",
+                "fingerprint": {"protocol": "http2"},
+            }
+        ).encode()
+
+    monkeypatch.setenv("IMPERSONATE_API_KEY", "ci-secret")
+    monkeypatch.setattr(
+        FingerprintManager,
+        "_fetch_fingerprint_payload",
+        staticmethod(fetch_payload),
+    )
+
+    payload = _load_raw_fingerprint("testing", "https://api.test", "http2")
+
+    assert payload["source"] == "ping"
+    assert requests == [
+        (
+            "https://api.test/raw?name=testing&protocol=http2",
+            {"Authorization": "Bearer ci-secret"},
+        )
+    ]
+
+
 def test_header_line_matches_ignores_accept_language_value():
     assert _header_line_matches("accept-language: en-US", "Accept-Language: zh-CN")
     assert not _header_line_matches("accept: text/html", "accept: application/json")
@@ -595,7 +630,10 @@ def test_live_fingerprint_data_matches_runtime_output(monkeypatch, tmp_path):
     for target in custom_targets:
         if should_print_target_progress:
             print(f"verifying fingerprint: {target}")
-        raw_payload = _load_raw_fingerprint(target, api_root)
+        protocol = (
+            "http3" if fingerprints[target].http_version in {"v3", "h3"} else "http2"
+        )
+        raw_payload = _load_raw_fingerprint(target, api_root, protocol)
         if raw_payload.get("source") == "ping":
             ping_payload = requests.get(
                 PING_FP_URL,
@@ -612,6 +650,70 @@ def test_live_fingerprint_data_matches_runtime_output(monkeypatch, tmp_path):
             peet_payload = requests.get(
                 TLS_PEET_URL,
                 impersonate=target,
+                timeout=30,
+            ).json()
+            _verify_api_fingerprint(
+                target=target,
+                raw_payload=raw_payload,
+                peet_payload=peet_payload,
+                mismatches=mismatches,
+            )
+
+    if mismatches:
+        formatted = []
+        for target in sorted(mismatches):
+            formatted.append(target)
+            formatted.extend(mismatches[target])
+        raise AssertionError("\n\n".join(formatted))
+
+
+def test_live_http3_fingerprint_data_matches_runtime_output(monkeypatch, tmp_path):
+    api_key = _require_live_api_key()
+    monkeypatch.setenv("IMPERSONATE_CONFIG_DIR", str(tmp_path))
+
+    FingerprintManager.load_fingerprints.cache_clear()
+    FingerprintManager.set_api_key(api_key=api_key)
+
+    api_root = FingerprintManager.get_api_root()
+    updated = FingerprintManager.update_fingerprints(api_root)
+    assert updated is not None and updated > 0
+
+    fingerprints = FingerprintManager.load_fingerprints()
+    assert fingerprints
+
+    preset_targets = {item["target_name"] for item in NATIVE_IMPERSONATE_TARGETS}
+    custom_targets = sorted(
+        target
+        for target, fingerprint in fingerprints.items()
+        if target not in preset_targets and fingerprint.http3_settings
+    )
+    assert custom_targets, "No non-preset HTTP/3 fingerprints found in updated cache"
+
+    mismatches: dict[str, list[str]] = {}
+    should_print_target_progress = _should_print_target_progress()
+
+    for target in custom_targets:
+        if should_print_target_progress:
+            print(f"verifying HTTP/3 fingerprint: {target}")
+        raw_payload = _load_raw_fingerprint(target, api_root, "http3")
+        if raw_payload.get("source") == "ping":
+            ping_payload = requests.get(
+                PING_FP_URL,
+                impersonate=target,
+                http_version="v3",
+                timeout=30,
+            ).json()
+            _verify_ping_fingerprint(
+                target=target,
+                raw_payload=raw_payload,
+                ping_payload=ping_payload,
+                mismatches=mismatches,
+            )
+        else:
+            peet_payload = requests.get(
+                TLS_PEET_URL,
+                impersonate=target,
+                http_version="v3",
                 timeout=30,
             ).json()
             _verify_api_fingerprint(

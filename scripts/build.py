@@ -14,7 +14,7 @@ from urllib.request import urlretrieve
 from cffi import FFI
 
 # this is the upstream libcurl-impersonate version
-__version__ = "2.0.0rc3"
+__version__ = "2.2.0"
 
 
 def is_android_env() -> bool:
@@ -55,7 +55,9 @@ def detect_arch():
             and ("libc" not in arch or arch.get("libc") == libc)
             and ("multiarch" not in arch or arch.get("multiarch") == multiarch)
         ):
-            if arch.get("libdir"):
+            if build_dir := os.environ.get("IMPERSONATE_BUILD_DIR"):
+                arch["libdir"] = os.path.expanduser(build_dir)
+            elif arch.get("libdir"):
                 arch["libdir"] = os.path.expanduser(arch["libdir"])
             else:
                 if "CI" in os.environ:
@@ -72,8 +74,33 @@ def detect_arch():
     raise Exception(f"Unsupported arch: {uname}")
 
 
+def get_link_type(arch):
+    link_type = os.environ.get("IMPERSONATE_LINK_TYPE", arch.get("link_type"))
+    if link_type not in ("static", "dynamic"):
+        raise ValueError(
+            "IMPERSONATE_LINK_TYPE must be either 'static' or 'dynamic', "
+            f"not {link_type!r}"
+        )
+    return link_type
+
+
+def get_obj_name(arch, link_type):
+    if link_type == arch.get("link_type"):
+        return arch["obj_name"]
+    if link_type == "static":
+        if arch["system"] == "Windows":
+            raise ValueError("Static linking is not supported on Windows")
+        return "libcurl-impersonate.a"
+    if arch["system"] == "Darwin":
+        return "libcurl-impersonate.dylib"
+    if arch["system"] == "Linux":
+        return "libcurl-impersonate.so"
+    return "libcurl-impersonate.dll"
+
+
 arch = detect_arch()
-link_type = arch.get("link_type")
+link_type = get_link_type(arch)
+obj_name = get_obj_name(arch, link_type)
 libdir = Path(arch["libdir"])
 is_static = link_type == "static"
 is_dynamic = link_type == "dynamic"
@@ -82,7 +109,7 @@ print(f"Using {libdir} to store libcurl-impersonate")
 
 
 def download_libcurl():
-    expected = libdir / arch["obj_name"]
+    expected = libdir / obj_name
     if expected.exists():
         print(f"libcurl-impersonate: {expected} already downloaded.")
         return
@@ -137,7 +164,7 @@ def get_curl_archives():
     if is_static:
         # note that the order of libraries matters
         # https://stackoverflow.com/a/36581865
-        return [str(libdir / arch["obj_name"])]
+        return [str(libdir / obj_name)]
     else:
         return []
 
@@ -194,6 +221,9 @@ ffibuilder.set_source(
         #include "shim.h"
     """,
     library_dirs=[str(libdir)],
+    runtime_library_dirs=(
+        [str(libdir)] if is_dynamic and arch["system"] != "Windows" else []
+    ),
     libraries=get_curl_libraries(),
     extra_objects=[],  # linked via extra_link_args
     source_extension=".c",

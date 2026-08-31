@@ -9,7 +9,7 @@ import math
 import queue
 import warnings
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from io import BytesIO
 from json import dumps
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, Union, cast, final
@@ -28,9 +28,9 @@ from .impersonate import (
     TLS_VERSION_MAP,
     ExtraFingerprints,
     resolve_latest_browser_type,
-    toggle_extension,
 )
 from .models import Request
+from .streams import RequestContent, RequestData, _FileReader, _IterableReader
 
 if TYPE_CHECKING:
     from ..curl import Curl
@@ -253,23 +253,6 @@ def peek_aio_queue(q: asyncio.Queue, default=None):
         return default
 
 
-def toggle_extensions_by_ids(curl: Curl, extension_ids):
-    # TODO: find a better representation, rather than magic numbers
-    default_enabled = {0, 10, 11, 13, 16, 23, 35, 43, 45, 51, 65281}
-
-    to_enable_ids = extension_ids - default_enabled
-    for ext_id in to_enable_ids:
-        toggle_extension(curl, ext_id, enable=True)
-
-    # print("to_enable: ", to_enable_ids)
-
-    to_disable_ids = default_enabled - extension_ids
-    for ext_id in to_disable_ids:
-        toggle_extension(curl, ext_id, enable=False)
-
-    # print("to_disable: ", to_disable_ids)
-
-
 def set_ja3_options(curl: Curl, ja3: str, permute: bool = False):
     """
     Detailed explanation: https://engineering.salesforce.com/tls-fingerprinting-with-ja3-and-ja3s-247362855967/
@@ -299,9 +282,6 @@ def set_ja3_options(curl: Curl, ja3: str, permute: bool = False):
             CurlCffiWarning,
             stacklevel=1,
         )
-    extension_ids = set(int(e) for e in extensions.split("-"))
-    toggle_extensions_by_ids(curl, extension_ids)
-
     if not permute:
         curl.setopt(CurlOpt.TLS_EXTENSION_ORDER, extensions)
 
@@ -442,11 +422,6 @@ def _apply_fingerprint(
     existing_header_names: set[str],
     default_headers: bool,
 ) -> None:
-    if fingerprint.http_version:
-        curl.setopt(
-            CurlOpt.HTTP_VERSION, normalize_http_version(fingerprint.http_version)
-        )
-
     if fingerprint.tls_version:
         tls_version = _normalize_tls_version(fingerprint.tls_version)
         curl.setopt(CurlOpt.SSLVERSION, tls_version | CurlSslVersion.MAX_DEFAULT)
@@ -456,8 +431,6 @@ def _apply_fingerprint(
 
     if fingerprint.tls_extension_order:
         tls_extension_order = _strip_padding_extension(fingerprint.tls_extension_order)
-        extension_ids = set(int(e) for e in tls_extension_order.split("-"))
-        toggle_extensions_by_ids(curl, extension_ids)
         if not fingerprint.tls_permute_extensions:
             curl.setopt(CurlOpt.TLS_EXTENSION_ORDER, tls_extension_order)
 
@@ -471,9 +444,12 @@ def _apply_fingerprint(
             CurlOpt.TLS_USE_NEW_ALPS_CODEPOINT,
             int(fingerprint.tls_use_new_alps_codepoint),
         )
+    # Explicit extension orders are also allowlists in our BoringSSL fork, so
+    # enable browser capabilities here and let the selected order suppress them.
+    curl.setopt(CurlOpt.TLS_STATUS_REQUEST, 1)
     curl.setopt(
         CurlOpt.TLS_SIGNED_CERT_TIMESTAMPS, int(fingerprint.tls_signed_cert_timestamps)
-    )
+        )
     curl.setopt(CurlOpt.TLS_KEY_SHARES_LIMIT, fingerprint.tls_key_shares_limit)
 
     if fingerprint.tls_cert_compression:
@@ -508,6 +484,11 @@ def _apply_fingerprint(
 
     if fingerprint.tls_ech is not None:
         curl.setopt(CurlOpt.ECH, fingerprint.tls_ech)
+
+    if fingerprint.tls_trust_anchors is not None:
+        curl.setopt(
+            CurlOpt.TLS_TRUST_ANCHORS, ",".join(fingerprint.tls_trust_anchors)
+        )
 
     # http2 settings
     if fingerprint.http2_settings:
@@ -556,6 +537,8 @@ def _apply_fingerprint(
         curl.setopt(
             CurlOpt.QUIC_TRANSPORT_PARAMETERS, fingerprint.quic_transport_parameters
         )
+    if fingerprint.quic_cid_length is not None:
+        curl.setopt(CurlOpt.QUIC_CID_LENGTH, fingerprint.quic_cid_length)
 
     # websocket settings
     if fingerprint.ws_header_order:
@@ -612,9 +595,8 @@ def set_curl_options(
         Union[dict[str, object], list[object], tuple[object, ...], None]
     ] = [],  # noqa: B006
     base_url: Optional[str] = None,
-    data: Optional[
-        Union[dict[str, str], list[tuple[object]], str, BytesIO, bytes]
-    ] = None,
+    data: Optional[RequestData] = None,
+    content: Optional[RequestContent] = None,
     json: Optional[dict[object, object] | list[object]] = None,
     headers_list: list[Optional[HeaderTypes]] = [],  # noqa: B006
     cookies_list: list[Optional[CookieTypes]] = [],  # noqa: B006
@@ -652,8 +634,47 @@ def set_curl_options(
 
     method = method.upper()  # type: ignore
 
+    # content/data/body/json
+    body_data = content if content is not None else data
+    stream_reader: object | None = None
+    if content is not None:
+        if isinstance(content, str):
+            body = content.encode()
+        elif isinstance(content, (bytes, bytearray)):
+            body = bytes(content)
+        elif hasattr(content, "read"):
+            stream_reader = _FileReader(content)
+            body = b""
+        else:
+            stream_reader = _IterableReader(cast(Iterable[bytes], content))
+            body = b""
+    elif isinstance(data, dict | list | tuple):
+        body = urlencode(data).encode()
+    elif isinstance(data, str):
+        body = data.encode()
+    elif isinstance(data, BytesIO):
+        body = data.read()
+    elif isinstance(data, bytes):
+        body = data
+    elif data is None:
+        body = b""
+    else:
+        raise TypeError("data must be dict/list/tuple, str, BytesIO or bytes")
+
+    if json is not None:
+        body = dumps(json, separators=(",", ":")).encode()
+
+    if (
+        (content is not None or data is not None or json is not None)
+        and multipart is None
+        and stream_reader is None
+    ):
+        request_body = body
+    else:
+        request_body = None
+
     # method
-    if method == "POST":
+    if method == "POST" and stream_reader is None:
         c.setopt(CurlOpt.POST, 1)
     elif method != "GET":
         c.setopt(CurlOpt.CUSTOMREQUEST, method.encode())
@@ -674,29 +695,17 @@ def set_curl_options(
         url = requote_uri(url)
     c.setopt(CurlOpt.URL, url.encode())
 
-    # data/body/json
-    if isinstance(data, dict | list | tuple):
-        body = urlencode(data).encode()
-    elif isinstance(data, str):
-        body = data.encode()
-    elif isinstance(data, BytesIO):
-        body = data.read()
-    elif isinstance(data, bytes):
-        body = data
-    elif data is None:
-        body = b""
-    else:
-        raise TypeError("data must be dict/list/tuple, str, BytesIO or bytes")
-    if json is not None:
-        body = dumps(json, separators=(",", ":")).encode()
-    body_provided = data is not None or json is not None
-    request_body = body if body_provided and multipart is None else None
-
     # Tell libcurl to be aware of bodies and related headers when,
     # 1. POST/PUT/PATCH, even if the body is empty, it's up to curl to decide what to do
     # 2. GET/DELETE with body, although it's against the RFC, some applications.
     #   e.g. Elasticsearch, use this.
-    if body or method in ("POST", "PUT", "PATCH"):
+    if stream_reader is not None:
+        c.setopt(CurlOpt.UPLOAD, 1)
+        c.setopt(CurlOpt.READDATA, stream_reader)
+        if isinstance(stream_reader, _FileReader) and stream_reader.rewindable:
+            c.setopt(CurlOpt.SEEKDATA, stream_reader)
+        c.setopt(CurlOpt.CUSTOMREQUEST, method.encode())
+    elif body or method in ("POST", "PUT", "PATCH"):
         c.setopt(CurlOpt.POSTFIELDS, body)
         # necessary if body contains '\0'
         c.setopt(CurlOpt.POSTFIELDSIZE, len(body))
@@ -710,6 +719,16 @@ def set_curl_options(
     encoding = headers.encoding if isinstance(headers, Headers) else None
     h = Headers(base_headers, encoding=encoding)
     h.update(headers)
+
+    # set the uploading size if it's known
+    if stream_reader is not None:
+        if isinstance(stream_reader, _FileReader) and stream_reader.length is not None:
+            content_length = str(stream_reader.length)
+            h["Content-Length"] = content_length
+        else:
+            content_length = h.get("content-length")
+        if content_length is not None:
+            c.setopt(CurlOpt.INFILESIZE_LARGE, int(content_length))
 
     # Previously we removed Host for https://github.com/lexiforest/curl_cffi/issues/119
     # Since curl-impersonate 1.5.0, curl always use Host parsed from url as cookiehost
@@ -728,11 +747,11 @@ def set_curl_options(
     # Add content-type if missing
     if json is not None:
         update_header_line(header_lines, "Content-Type", "application/json")
-    if isinstance(data, dict) and method != "POST":
+    if content is None and isinstance(data, dict) and method != "POST":
         update_header_line(
             header_lines, "Content-Type", "application/x-www-form-urlencoded"
         )
-    if isinstance(data, str | bytes) and data:
+    if isinstance(body_data, (str, bytes, bytearray)) and body_data:
         update_header_line(header_lines, "Content-Type", "application/octet-stream")
 
     # Never send `Expect` header.

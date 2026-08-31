@@ -150,6 +150,32 @@ def test_write_function(server):
     assert buffer.getvalue() == b"foo=bar"
 
 
+def test_write_function_keyboard_interrupt(server):
+    c = Curl()
+    c.setopt(CurlOpt.URL, str(server.url).encode())
+
+    def write(data: bytes):
+        raise KeyboardInterrupt
+
+    c.setopt(CurlOpt.WRITEFUNCTION, write)
+    with pytest.raises(KeyboardInterrupt):
+        c.perform()
+
+
+def test_debug_function_exception(server):
+    c = Curl()
+    c.setopt(CurlOpt.URL, str(server.url).encode())
+    c.setopt(CurlOpt.WRITEDATA, BytesIO())
+    c.setopt(CurlOpt.VERBOSE, 1)
+
+    def debug(type_: int, data: bytes):
+        raise ValueError("debug callback failed")
+
+    c.setopt(CurlOpt.DEBUGFUNCTION, debug)
+    with pytest.raises(ValueError, match="debug callback failed"):
+        c.perform()
+
+
 def test_read_function(server):
     c = Curl()
     url = str(server.url.copy_with(path="/echo_body"))
@@ -235,6 +261,7 @@ def test_follow_redirect(server):
     c.setopt(CurlOpt.FOLLOWLOCATION, 1)
     c.perform()
     assert c.getinfo(CurlInfo.RESPONSE_CODE) == 200
+    assert c.getinfo(CurlInfo.REDIRECT_HISTORY) == [f"301\t{url}".encode()]
 
 
 def test_not_follow_redirect(server):
@@ -243,6 +270,7 @@ def test_not_follow_redirect(server):
     c.setopt(CurlOpt.URL, url.encode())
     c.perform()
     assert c.getinfo(CurlInfo.RESPONSE_CODE) == 301
+    assert c.getinfo(CurlInfo.REDIRECT_HISTORY) == []
 
 
 def test_http_proxy_changed_path(server):
@@ -320,6 +348,21 @@ def test_status_code(server):
     c.setopt(CurlOpt.URL, url.encode())
     c.perform()
     assert c.getinfo(CurlInfo.RESPONSE_CODE) == 200
+
+
+def test_active_socket(server):
+    c = Curl()
+    c.setopt(CurlOpt.URL, str(server.url).encode())
+    c.setopt(CurlOpt.CONNECT_ONLY, 1)
+    c.perform()
+    socket = c.getinfo(CurlInfo.ACTIVESOCKET)
+    assert isinstance(socket, int)
+    assert socket >= 0
+
+
+def test_active_socket_without_connection():
+    c = Curl()
+    assert c.getinfo(CurlInfo.ACTIVESOCKET) == -1
 
 
 def test_response_headers(server):
